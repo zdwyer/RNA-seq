@@ -1,0 +1,229 @@
+#!/usr/bin/env python2.7
+
+import argparse, subprocess, os, gzip, logging, time, collections, HTSeq
+from itertools import izip_longest
+from collections import defaultdict
+
+logging.basicConfig(filename='RNAseq.log', filemode='w', format='%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S', level=logging.INFO)
+
+def main(args):
+
+	global_start_time = time.time()
+	samples = []
+
+	TPM_summary = defaultdict(float)
+	transcript_lengths = {}
+
+	raw_count_summary = defaultdict(int)
+	
+	SI_summary = defaultdict(float)
+	intron_lengths = {}
+
+	logging.info('Reading transcript ranges from %s' % (args.transcript_intervals))
+	transcripts = HTSeq.GenomicArrayOfSets("auto", stranded=False)
+	for line in open(args.transcript_intervals):
+		fields = line.rstrip().split('\t')
+		iv = HTSeq.GenomicInterval(fields[1], int(fields[2])-1, int(fields[3]))
+		transcripts[iv] += fields[0]
+		transcript_lengths[fields[0]] = int(fields[3]) - int(fields[2]) + 1
+
+	logging.info('Reading intron ranges from %s' % (args.intron_intervals))
+	introns = HTSeq.GenomicArrayOfSets("auto", stranded=False)
+	for line in open(args.intron_intervals):
+		fields = line.rstrip().split('\t')
+		iv = HTSeq.GenomicInterval(fields[1], int(fields[2])-1, int(fields[3]))
+		introns[iv] += fields[0]
+		intron_lengths[fields[0]] = int(fields[3]) - int(fields[2]) + 1
+
+	for n, i in enumerate(args.input_files):
+
+		sample_start_time = time.time()
+
+		infile = i.split('/')[-1]
+		logging.info('Processing %s' % (infile))
+		
+		samples.append(infile)
+
+		# Create folder for each sample
+		if not os.path.exists(infile):
+			os.makedirs(infile)
+
+		# Trim adapter sequences
+		if not args.skipTrim:
+			logging.info('\tTrimming Adapter Sequences')
+			trimAdapters(i, infile, args.trimJar, args.trimAdapter)
+		else:
+			logging.info('\tSkipping Trimming of Adapter Sequences')
+
+		# Alignment
+		if not args.skipAlignment:
+			logging.info('\tAligning Reads to Genome')
+			align(infile)
+		else:
+			logging.info('\tSkipping Alignment of Reads to Genome')
+		
+		# Pool Reads
+		if not args.skipExpression:
+			logging.info('\tCalculating Transcript Counts with a read length of %d' % (args.read_length[n]))
+			expression(infile, transcripts, introns, transcript_lengths, intron_lengths, TPM_summary, SI_summary, args.read_length[n], args.minOverhang, raw_count_summary)
+		else:
+			logging.info('\tSkipping Calculation of Transcript Counts')
+
+		logging.info('Finished Processing %s in %ds' % (infile, time.time()-sample_start_time))
+
+	logging.info('Writing Summary Files')
+	with open('TPM_summary.txt', 'w') as TPM_summary_out:
+		TPM_summary_out.write('Transcript\t%s\n' % ('\t'.join([sample for sample in samples])))
+		for t in sorted(transcript_lengths.keys()):
+			TPM_summary_out.write('%s\t%s\n' % (t, '\t'.join([str(TPM_summary[(sample, t)]) for sample in samples])))
+
+	with open('raw_count_summary.txt', 'w') as raw_count_summary_out:
+		raw_count_summary_out.write('Transcript\t%s\n' % ('\t'.join([sample for sample in samples])))
+		for t in sorted(transcript_lengths.keys()):
+			raw_count_summary_out.write('%s\t%s\n' % (t, '\t'.join([str(raw_count_summary[(sample, t)]) for sample in samples])))
+
+	with open('SI_summary.txt', 'w') as SI_summary_out:
+		SI_summary_out.write('Intron\t%s\n' % ('\t'.join([sample for sample in samples])))
+		for t in sorted(intron_lengths.keys()):
+			SI_summary_out.write('%s\t%s\n' % (t, '\t'.join([str(SI_summary[(sample, t)]) for sample in samples])))
+
+	logging.info('Total Time: %ds' % (time.time()-global_start_time))
+
+def trimAdapters(fullpath, infile, trimmomatic_jar, trimmomatic_adapters):
+	cmd = 'java -jar %s PE -phred33 %s_R1.fastq.gz %s_R2.fastq.gz %s/%s_R1_P.fastq.gz %s/%s_R1_U.fastq.gz %s/%s_R2_P.fastq.gz %s/%s_R2_U.fastq.gz ILLUMINACLIP:%s:2:30:10' % (trimmomatic_jar, fullpath, fullpath, infile, infile, infile, infile, infile, infile, infile, infile, trimmomatic_adapters)
+	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+	(out, err) = proc.communicate()
+	with open('%s/%s_trim.log' % (infile, infile), 'w') as trimOut:
+		trimOut.write(err)
+	info = err.split('\n')[5].split(' ')
+	logging.info('\t\tInput Read Pairs: %s\n\t\t\t\tBoth Surviving: %s\n\t\t\t\tForward Only Surviving: %s\n\t\t\t\tReverse Only Surviving: %s\n\t\t\t\tDropped: %s' % (info[3], info[6], info[11], info[16], info[19]))
+
+def align(infile):
+	cmd = 'hisat2 -p 4 --phred33 --max-intronlen 1000 -x ~/Lab/Genomes/cerevisiae/hisat/sc_hisatIndex_R64-2.1 -1 %s/%s_R1_P.fastq.gz -2 %s/%s_R2_P.fastq.gz | samtools view -bh - | samtools sort - -o %s/%s.bam' % (infile, infile, infile, infile, infile, infile)
+	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+	(out, err) = proc.communicate()
+	with open('%s/%s_alignment.log' % (infile, infile), 'w') as alignOut:
+		alignOut.write(err)
+
+def expression(infile, transcripts, introns, transcript_lengths, intron_lengths, TPM_summary, SI_summary, read_length, minOverhang, raw_count_summary):
+	transcript_counts = collections.Counter()
+	ambiguous_transcripts = 0
+	no_feature_transcripts = 0
+
+	intron_counts = collections.Counter()
+	junction_counts = collections.Counter()
+	ambiguous_introns = 0
+	ambiguous_junctions = 0
+
+	numProcessed = 0
+	local_start_time = time.time()
+
+	logging.info('\t\tProcessing Alignments')
+	for first, second in HTSeq.pair_SAM_alignments_with_buffer(HTSeq.BAM_Reader('%s/%s.bam' % (infile, infile))):
+		transcript_ids = set()
+		intron_ids = set()
+		junction_ids = set()
+		if first != None and first.aligned and first.aQual > 5:
+			for cigop in first.cigar:
+				if cigop.type == 'M':
+					for iv, val in transcripts[cigop.ref_iv].steps():
+						transcript_ids |= val
+					for iv, val in introns[cigop.ref_iv].steps():
+						intron_ids |= val
+				elif cigop.type == 'N':
+					for iv, val in introns[cigop.ref_iv].steps():
+						junction_ids |= val
+		if second != None and second.aligned and second.aQual > 5:
+			for cigop in second.cigar:
+				if cigop.type == 'M':
+					for iv, val in transcripts[cigop.ref_iv].steps():
+						transcript_ids |= val
+					for iv, val in introns[cigop.ref_iv].steps():
+						intron_ids |= val
+				elif cigop.type =='N':
+					for iv, val in introns[cigop.ref_iv].steps():
+						junction_ids |= val
+
+		if len(transcript_ids) == 1:
+			gene_id = list(transcript_ids)[0]
+			transcript_counts[gene_id] += 1
+		elif len(transcript_ids) == 0:
+			no_feature_transcripts += 1
+		else:
+			ambiguous_transcripts += 1
+
+        ## TO DO: Update so reads hitting multiple introns / junctions work
+		if len(intron_ids) == 1:
+			intron_id = list(intron_ids)[0]
+			intron_counts[intron_id] += 1
+		elif len(intron_ids) > 1:
+			ambiguous_introns += 1
+
+		if len(junction_ids) == 1:
+			junction_id = list(junction_ids)[0]
+			junction_counts[junction_id] += 1
+		elif len(junction_ids) > 1:
+			ambiguous_junctions += 1
+
+		if numProcessed > 0 and numProcessed % 1000000 == 0:
+			logging.info('\t\tProcessed %d Fragments in %ds' % (numProcessed, time.time()-local_start_time))
+		numProcessed += 1
+
+	logging.info('\tAmbiguous Fragments: %d' % (ambiguous_transcripts))
+	logging.info('\tFeatureless Fragments: %d' % (no_feature_transcripts))
+
+	logging.info('\tAdding raw counts to summary.')
+	for gene_id in transcript_counts:
+		raw_count_summary[(infile, gene_id)] = transcript_counts[gene_id]
+
+	logging.info('\tCalculating FPK values per transcript.')
+	transcript_fpk = {}
+	transcript_fpk_sum = 0.0
+	for transcript in transcript_counts:
+		transcript_fpk[transcript] = transcript_counts[transcript] / (transcript_lengths[transcript] / 1000.0)
+		transcript_fpk_sum += transcript_fpk[transcript]
+	scaling_factor = transcript_fpk_sum / 1000000.0
+
+	logging.info('\tWriting TPM values with scaling factor: %f' % (scaling_factor))
+	with open('%s/%s_transcriptCounts.txt' % (infile, infile), 'w') as transcriptOut:
+		for gene_id in sorted(transcript_counts):
+			transcriptOut.write('%s\t%d\t%f\t%f\n' % (gene_id, transcript_counts[gene_id], transcript_fpk[gene_id], transcript_fpk[gene_id] / scaling_factor))
+			TPM_summary[(infile, gene_id)] = transcript_fpk[gene_id] / scaling_factor
+
+	logging.info('\tCalculating Splicing Information')
+	combined = set()
+	for feature in intron_counts.keys():
+		combined.add(feature)
+	for feature in junction_counts.keys():
+		combined.add(feature)
+
+	with open('%s/%s_splicingCounts.txt' % (infile, infile), 'w') as splicingOut:
+		for feature in sorted(combined):
+			if junction_counts[feature] > 0:
+				splicingOut.write('%s\t%d\t%d\t%f\n' % (feature, junction_counts[feature], intron_counts[feature], (intron_counts[feature] / ((intron_lengths[feature] + read_length*2 - 2*minOverhang) / 1000.0)) / (junction_counts[feature] / ((read_length*2 - minOverhang*2) / 1000.0))))
+				SI_summary[(infile, feature)] = (intron_counts[feature] / ((intron_lengths[feature] + read_length*2 - 2*minOverhang) / 1000.0)) / (junction_counts[feature] / ((read_length*2 - minOverhang*2) / 1000.0))
+			else:
+				splicingOut.write('%s\t%d\t%d\tNaN\n' % (feature, junction_counts[feature], intron_counts[feature]))
+				SI_summary[(infile, feature)] = 'NaN'
+
+def parseArguments():
+	parser = argparse.ArgumentParser(prog="RNAseq_PipeLine", description='', usage='%(prog)s [options]')
+	required = parser.add_argument_group('required arguments')
+	general = parser.add_argument_group('General Options')
+	trim = parser.add_argument_group('Trimming Options')
+	alignment = parser.add_argument_group('Alignment Options')
+	expression = parser.add_argument_group('Gene Expression Options')
+	required.add_argument('-i', '--input_files', nargs='+', required=True, help=' Basename of files to run without _R1 or _R2. (fastq.gz)', metavar='', dest='input_files')
+	general.add_argument('--read_length', type=int, nargs='+', default=101, help=' Read length of fastq files.', dest='read_length')
+	general.add_argument('--min_overhang', type=int, default=3, help=' Minamal overhang for introns and junctions.', dest='minOverhang')
+	trim.add_argument('--skip_Trim', action='store_true', help=' Skip the trimming of adapter sequences. Assumes files already exist.', dest='skipTrim')
+	trim.add_argument('--trimmomatic_path', default='/opt/Trimmomatic-0.36/trimmomatic-0.36.jar', help=' Path to Trimmomatic jar file.', dest='trimJar')
+	trim.add_argument('--trimmomatic_jar', default='/opt/Trimmomatic-0.36/adapters/TruSeq3-PE.fa', help=' Path to adapter file.', dest='trimAdapter')
+	alignment.add_argument('--skip_Align', action='store_true', help=' Skip the alignment of reads to genome. Assumes files already exist.', dest='skipAlignment')
+	expression.add_argument('--skip_Expression', action='store_true', help=' Skip the calculation of gene expression. Assumes files already exist.', dest='skipExpression')
+	expression.add_argument('--transcript_intervals', default='/home/zdwyer/Lab/Genomes/cerevisiae/sc_transcript_ranges.txt', help=' File containing intervals for which to count reads.', dest='transcript_intervals')
+	expression.add_argument('--intron_intervals', default='/home/zdwyer/Lab/Genomes/cerevisiae/sc_intronRanges.txt', help=' File containing intervals for which to count reads.', dest='intron_intervals')
+	return parser.parse_args()
+  
+args = parseArguments()
+main(args)
