@@ -58,7 +58,7 @@ def main(args):
 		# Alignment
 		if not args.skipAlignment:
 			logging.info('\tAligning Reads to Genome')
-			align(infile)
+			align(infile, args.alignIndex)
 		else:
 			logging.info('\tSkipping Alignment of Reads to Genome')
 		
@@ -98,8 +98,8 @@ def trimAdapters(fullpath, infile, trimmomatic_jar, trimmomatic_adapters):
 	info = err.split('\n')[5].split(' ')
 	logging.info('\t\tInput Read Pairs: %s\n\t\t\t\tBoth Surviving: %s\n\t\t\t\tForward Only Surviving: %s\n\t\t\t\tReverse Only Surviving: %s\n\t\t\t\tDropped: %s' % (info[3], info[6], info[11], info[16], info[19]))
 
-def align(infile):
-	cmd = 'hisat2 -p 4 --phred33 --max-intronlen 1000 -x ~/Lab/Genomes/cerevisiae/hisat/sc_hisatIndex_R64-2.1 -1 %s/%s_R1_P.fastq.gz -2 %s/%s_R2_P.fastq.gz | samtools view -bh - | samtools sort - -o %s/%s.bam' % (infile, infile, infile, infile, infile, infile)
+def align(infile, alignIndex):
+	cmd = 'hisat2 -p 4 --phred33 --max-intronlen 1000 -x %s -1 %s/%s_R1_P.fastq.gz -2 %s/%s_R2_P.fastq.gz | samtools view -bh - | samtools sort - -o %s/%s.bam' % (alignIndex, infile, infile, infile, infile, infile, infile)
 	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
 	(out, err) = proc.communicate()
 	with open('%s/%s_alignment.log' % (infile, infile), 'w') as alignOut:
@@ -218,8 +218,9 @@ def parseArguments():
 	general.add_argument('--min_overhang', type=int, default=3, help=' Minamal overhang for introns and junctions.', dest='minOverhang')
 	trim.add_argument('--skip_Trim', action='store_true', help=' Skip the trimming of adapter sequences. Assumes files already exist.', dest='skipTrim')
 	trim.add_argument('--trimmomatic_path', default='/opt/Trimmomatic-0.36/trimmomatic-0.36.jar', help=' Path to Trimmomatic jar file.', dest='trimJar')
-	trim.add_argument('--trimmomatic_jar', default='/opt/Trimmomatic-0.36/adapters/TruSeq3-PE.fa', help=' Path to adapter file.', dest='trimAdapter')
+	trim.add_argument('--trimmomatic_adapters', default='/opt/Trimmomatic-0.36/adapters/TruSeq3-PE.fa', help=' Path to adapter file.', dest='trimAdapter')
 	alignment.add_argument('--skip_Align', action='store_true', help=' Skip the alignment of reads to genome. Assumes files already exist.', dest='skipAlignment')
+	alignment.add_argument('--align_index', default='~/Lab/Genomes/cerevisiae/hisat/sc_hisatIndex_R64-2.1', help=' Path to the hisat index.', dest='alignIndex')
 	expression.add_argument('--skip_Expression', action='store_true', help=' Skip the calculation of gene expression. Assumes files already exist.', dest='skipExpression')
 	expression.add_argument('--transcript_intervals', default='/home/zdwyer/Lab/Genomes/cerevisiae/sc_transcript_ranges.txt', help=' File containing intervals for which to count reads.', dest='transcript_intervals')
 	expression.add_argument('--intron_intervals', default='/home/zdwyer/Lab/Genomes/cerevisiae/sc_intronRanges.txt', help=' File containing intervals for which to count reads.', dest='intron_intervals')
